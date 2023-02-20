@@ -26,6 +26,12 @@
 #include "math.h"
 #include "string.h"
 #include "stdlib.h"
+#include "Functions/mit_sending.h"
+#include "Functions/mit_receiving.h"
+#include "Functions/extra_motor_function.h"
+#include "Functions/servo_sending.h"
+#include "Functions/servo_receiving.h"
+#include "Functions/motor_control_demos.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -62,9 +68,8 @@ DMA_HandleTypeDef hdma_adc1;
 
 CAN_HandleTypeDef hcan1;
 
-TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim4;
-TIM_HandleTypeDef htim6;
+TIM_HandleTypeDef htim5;
 TIM_HandleTypeDef htim7;
 
 UART_HandleTypeDef huart2;
@@ -123,21 +128,42 @@ volatile uint8_t controlMode = 0; // 0: Rest, 1: Position Control, 2: Velocity C
 
 volatile float controlInput = 0;
 
-volatile uint16_t tim6_cycle_time;
-uint16_t tim6_cycle_time_max;
+volatile uint16_t tim4_cycle_time;
+uint16_t tim4_cycle_time_max;
+
+//CAN and Motor
+uint8_t buffer[8];
+CAN_RxHeaderTypeDef   Rx0Header;
+uint8_t               Rx0Data[8];
+
+float motor_pos;
+float motor_spd;
+float motor_cur;
+int8_t motor_temp;
+int8_t motor_error;
+
+
+float rpm=300.0f;
+float position=180.0f;
+float acceleration = 100.0f;
+float current = 0.0f;
+float duty = 0.0f;
+
+static uint8_t controller_id=1;
+volatile uint8_t flag=14;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
-static void MX_TIM4_Init(void);
-static void MX_TIM2_Init(void);
 static void MX_DMA_Init(void);
 static void MX_TIM7_Init(void);
 static void MX_USART2_UART_Init(void);
-static void MX_TIM6_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_CAN1_Init(void);
+static void MX_TIM4_Init(void);
+static void MX_TIM5_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -167,10 +193,39 @@ void UART_RX_DMA_Handler(){
     }
   }
 
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan){
+  if(HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &Rx0Header, Rx0Data) == HAL_OK){
+    motor_receive(Rx0Data);
+  }  
+}
 
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin){
+  if(GPIO_Pin == GPIO_PIN_13){
+    if (flag==0){
+      comm_can_set_origin(controller_id, 1);
+    }
+    else if(flag==14){
+      // [[ Timer1 Init ]]
+      // [[ Start main loop ]] (200Hz)
+      gravity_compensation_initialize(controller_id);
+      HAL_TIM_Base_Start_IT(&htim4);
+      
+    }
+    else if(flag==82){
+      
+      HAL_TIM_Base_Stop_IT(&htim4);
+      HAL_TIM_Base_Stop_IT(&htim5);
+      exit_motor_mode_servo(controller_id);                                 //exit
+
+    }
+    }
+  }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
-  if (htim == &htim6) { // 1kHz
+  if (htim->Instance == TIM5){ //200Hz
+    comm_can_set_rpm(controller_id, rpm);
+  }
+  if (htim->Instance == TIM4) { // 1kHz
     //target profile
     uint8_t Period = 2;
     target = 30+50*(1-cosf(((float)clock2/(1000/Period))*M_PI));
@@ -198,10 +253,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
 
     if (Initialization == 1){
       timeSec = 0;
-      htim2.Instance->CNT = 0;
       Initialization = 0;
     }
     
+    if (timeSec == 3){
+      HAL_TIM_Base_Start_IT(&htim5);
+    }
     
 
     // USART Send Raw Data
@@ -214,9 +271,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
     UART_RX_DMA_Handler();
 
     // Real-time interrupt load check
-    tim6_cycle_time = htim6.Instance->CNT;
-    if(tim6_cycle_time_max < tim6_cycle_time) tim6_cycle_time_max = tim6_cycle_time;
+    tim4_cycle_time = htim4.Instance->CNT;
+    if(tim4_cycle_time_max < tim4_cycle_time) tim4_cycle_time_max = tim4_cycle_time;
   }
+  
 }
 
 /* USER CODE END 0 */
@@ -249,19 +307,32 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_TIM4_Init();
-  MX_TIM2_Init();
   MX_DMA_Init();
   MX_TIM7_Init();
   MX_USART2_UART_Init();
-  MX_TIM6_Init();
   MX_ADC1_Init();
   MX_CAN1_Init();
+  MX_TIM4_Init();
+  MX_TIM5_Init();
   /* USER CODE BEGIN 2 */
-  HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
-  HAL_GPIO_WritePin(GPIOC,GPIO_PIN_1,GPIO_PIN_SET);
-  HAL_TIM_PWM_Start(&htim4,TIM_CHANNEL_2);
-  HAL_TIM_Base_Start_IT(&htim6);
+  // [[ CAN Init ]]
+  // This mcu is CANOpen Master. So it should receive all can frame.
+  CAN_FilterTypeDef sFilterConfig0;
+  sFilterConfig0.FilterBank = 0;
+  sFilterConfig0.FilterMode = CAN_FILTERMODE_IDMASK;
+  sFilterConfig0.FilterScale = CAN_FILTERSCALE_16BIT;
+  sFilterConfig0.FilterIdLow = 0x0000;
+  sFilterConfig0.FilterMaskIdLow = 0x0000;
+  sFilterConfig0.FilterIdHigh = 0x0000;
+  sFilterConfig0.FilterMaskIdHigh = 0x0000;
+  sFilterConfig0.FilterFIFOAssignment = CAN_RX_FIFO0;
+  sFilterConfig0.FilterActivation = ENABLE;
+  HAL_CAN_ConfigFilter(&hcan1, &sFilterConfig0);
+
+  HAL_CAN_Start(&hcan1);
+  HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
+  
+  //Timer
   HAL_TIM_Base_Start(&htim7);
 
   HAL_UART_Receive_DMA(&huart2, rxDataDMA, RX_BUF_LEN);
@@ -274,6 +345,8 @@ int main(void)
   txData[TX_DATA_LEN-1] = 0xBB;
 
   PIDController_Init(&pid);
+  
+  
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -424,55 +497,6 @@ static void MX_CAN1_Init(void)
 }
 
 /**
-  * @brief TIM2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM2_Init(void)
-{
-
-  /* USER CODE BEGIN TIM2_Init 0 */
-  
-  /* USER CODE END TIM2_Init 0 */
-
-  TIM_Encoder_InitTypeDef sConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM2_Init 1 */
-  
-  /* USER CODE END TIM2_Init 1 */
-  htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 0;
-  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 1806;
-  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
-  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC1Filter = 0;
-  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC2Filter = 0;
-  if (HAL_TIM_Encoder_Init(&htim2, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM2_Init 2 */
-  
-  /* USER CODE END TIM2_Init 2 */
-
-}
-
-/**
   * @brief TIM4 Initialization Function
   * @param None
   * @retval None
@@ -481,22 +505,27 @@ static void MX_TIM4_Init(void)
 {
 
   /* USER CODE BEGIN TIM4_Init 0 */
-  
+
   /* USER CODE END TIM4_Init 0 */
 
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
 
   /* USER CODE BEGIN TIM4_Init 1 */
-  
+
   /* USER CODE END TIM4_Init 1 */
   htim4.Instance = TIM4;
-  htim4.Init.Prescaler = 0;
+  htim4.Init.Prescaler = 1;
   htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim4.Init.Period = 799;
+  htim4.Init.Period = 39999;
   htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_PWM_Init(&htim4) != HAL_OK)
+  if (HAL_TIM_Base_Init(&htim4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim4, &sClockSourceConfig) != HAL_OK)
   {
     Error_Handler();
   }
@@ -506,56 +535,61 @@ static void MX_TIM4_Init(void)
   {
     Error_Handler();
   }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 0;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim4, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
   /* USER CODE BEGIN TIM4_Init 2 */
-  
+
   /* USER CODE END TIM4_Init 2 */
-  HAL_TIM_MspPostInit(&htim4);
 
 }
 
 /**
-  * @brief TIM6 Initialization Function
+  * @brief TIM5 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_TIM6_Init(void)
+static void MX_TIM5_Init(void)
 {
 
-  /* USER CODE BEGIN TIM6_Init 0 */
+  /* USER CODE BEGIN TIM5_Init 0 */
 
-  /* USER CODE END TIM6_Init 0 */
+  /* USER CODE END TIM5_Init 0 */
 
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_SlaveConfigTypeDef sSlaveConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
 
-  /* USER CODE BEGIN TIM6_Init 1 */
+  /* USER CODE BEGIN TIM5_Init 1 */
 
-  /* USER CODE END TIM6_Init 1 */
-  htim6.Instance = TIM6;
-  htim6.Init.Prescaler = 1;
-  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim6.Init.Period = 39999;
-  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+  /* USER CODE END TIM5_Init 1 */
+  htim5.Instance = TIM5;
+  htim5.Init.Prescaler = 1;
+  htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim5.Init.Period = 199999;
+  htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim5, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sSlaveConfig.SlaveMode = TIM_SLAVEMODE_DISABLE;
+  sSlaveConfig.InputTrigger = TIM_TS_ITR2;
+  if (HAL_TIM_SlaveConfigSynchro(&htim5, &sSlaveConfig) != HAL_OK)
   {
     Error_Handler();
   }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim5, &sMasterConfig) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN TIM6_Init 2 */
+  /* USER CODE BEGIN TIM5_Init 2 */
 
-  /* USER CODE END TIM6_Init 2 */
+  /* USER CODE END TIM5_Init 2 */
 
 }
 
@@ -666,22 +700,11 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : PC13 */
   GPIO_InitStruct.Pin = GPIO_PIN_13;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PC1 */
-  GPIO_InitStruct.Pin = GPIO_PIN_1;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
 }
