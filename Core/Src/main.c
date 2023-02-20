@@ -26,8 +26,6 @@
 #include "math.h"
 #include "string.h"
 #include "stdlib.h"
-#include "Functions/mit_sending.h"
-#include "Functions/mit_receiving.h"
 #include "Functions/extra_motor_function.h"
 #include "Functions/servo_sending.h"
 #include "Functions/servo_receiving.h"
@@ -44,17 +42,18 @@
 #define M_PI 3.14159265358979323846
 #define TX_DATA_LEN 14 // [bytes] Including 4 bytes for padding, [clock2(2), current(4), target(4)]
 #define RX_BUF_LEN 21 // [bytes]
+#define MOTOR_ID 1
 
 /* Controller parameters */
 /* Derivative low-pass filter time constant */
 #define PID_TAU 0.0318f
 
 /* Output limits */
-#define PID_LIM_MIN -5.0f
-#define PID_LIM_MAX  5.0f
+#define PID_LIM_MIN -50.0f
+#define PID_LIM_MAX  50.0f
 
 /* Sample time (in seconds) */
-#define SAMPLE_TIME_S 0.001f
+#define SAMPLE_TIME_S 0.05f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -79,11 +78,11 @@ DMA_HandleTypeDef hdma_usart2_rx;
 /* USER CODE BEGIN PV */
 /* Initialise PID controller */
 /* Controller gains */
-float PID_KP = 5.0;
-float PID_KI = 0.5;
-float PID_KD = 0.25;
-float PID_LIM_MIN_INT = -50;
-float PID_LIM_MAX_INT = 50;
+float PID_KP = 0.4;
+float PID_KI = 0.04;
+float PID_KD = 0.03;
+float PID_LIM_MIN_INT = -70;
+float PID_LIM_MAX_INT = 70;
 
 PIDController pid = { &PID_KP, &PID_KI, &PID_KD,
                       PID_TAU,
@@ -107,9 +106,12 @@ uint16_t clock1PeakPrev = 0;
 uint16_t clock2 = 0;
 uint16_t timeSec = 0;
 
+volatile uint16_t tim4_cycle_time;
+uint16_t tim4_cycle_time_max;
+
 //adc filter
 uint16_t freqSampling = 1000;
-uint16_t freqCutoff = 200;
+uint16_t freqCutoff = 100;
 float T, tau, cutoff, a, b, c;
 
 uint16_t adcValue = 0;
@@ -118,23 +120,16 @@ float loadFiltered = 0.0;
 float loadFilteredPrev = 0.0;
 float target = 0.0;
 
-
 float f = 1000000;
 
-
-volatile uint8_t Initialization = 0;
-volatile uint8_t controlMode = 0; // 0: Rest, 1: Position Control, 2: Velocity Control, 3: Manual
-
-
-volatile float controlInput = 0;
-
-volatile uint16_t tim4_cycle_time;
-uint16_t tim4_cycle_time_max;
-
 //CAN and Motor
-uint8_t buffer[8];
+uint8_t buffer[8] = {0,0,0,0,0,0,0,0};
 CAN_RxHeaderTypeDef   Rx0Header;
 uint8_t               Rx0Data[8];
+
+uint8_t Initialization=0;
+uint8_t control_mode= 14; 
+uint8_t controller_id = 1;
 
 float motor_pos;
 float motor_spd;
@@ -149,8 +144,7 @@ float acceleration = 100.0f;
 float current = 0.0f;
 float duty = 0.0f;
 
-static uint8_t controller_id=1;
-volatile uint8_t flag=14;
+
 
 /* USER CODE END PV */
 
@@ -201,34 +195,45 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan){
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin){
   if(GPIO_Pin == GPIO_PIN_13){
-    if (flag==0){
-      comm_can_set_origin(controller_id, 1);
-    }
-    else if(flag==14){
-      // [[ Timer1 Init ]]
-      // [[ Start main loop ]] (200Hz)
-      gravity_compensation_initialize(controller_id);
-      HAL_TIM_Base_Start_IT(&htim4);
-      
-    }
-    else if(flag==82){
-      
-      HAL_TIM_Base_Stop_IT(&htim4);
-      HAL_TIM_Base_Stop_IT(&htim5);
-      exit_motor_mode_servo(controller_id);                                 //exit
+    HAL_TIM_Base_Stop_IT(&htim4);
+    HAL_TIM_Base_Stop_IT(&htim5);
+    exit_motor_mode_servo(controller_id);                                 //exit
 
     }
-    }
-  }
-
+ }
+ 
+float Period = 1.0;
+float amplitude = 300;
+float offset = 40;
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
   if (htim->Instance == TIM5){ //200Hz
-    comm_can_set_rpm(controller_id, rpm);
+    //current = PIDController_Update(&pid,target, loadFiltered);
+    //duty = 0.01f * PIDController_Update(&pid,target, loadFiltered);
+    //comm_can_set_duty(controller_id, duty);
+    //comm_can_set_current(controller_id, current);
+    
+    //comm_can_set_rpm(controller_id, rpm);
   }
   if (htim->Instance == TIM4) { // 1kHz
+    duty = 0.01f * PIDController_Update(&pid,target, loadFiltered);
+    comm_can_set_duty(controller_id, duty);
     //target profile
-    uint8_t Period = 2;
-    target = 30+50*(1-cosf(((float)clock2/(1000/Period))*M_PI));
+    
+    if (clock2<150 || clock2 >600) target = offset;
+    else if (150 < clock2 & clock2<300)
+    {
+      target = offset + 0.5 *amplitude * sinf(((float)clock2-150.0)/300.0*M_PI);
+    }
+    else if (300 <= clock2 & clock2<450)
+    {
+      target = offset+ 0.75*amplitude - 0.25*amplitude*cosf(((float)clock2-300.0)/150.0*M_PI);
+    }
+    else if (450 <= clock2 & clock2<600)
+    {
+      target = offset + 0.5*amplitude + amplitude/2*cosf(((float)clock2-450.0)/150.0*M_PI); 
+    }
+    //target = 100;
+    
     //filter adc
     T = (float)1/freqSampling;
     cutoff = 2 * M_PI * freqCutoff;
@@ -238,6 +243,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
     c = (2/T - cutoff)/(2/T+cutoff);
     
     loadFiltered=a*adcValue + b*adcValuePrev + c*loadFilteredPrev;
+    
+    loadFilteredPrev = loadFiltered;
+    adcValuePrev = adcValue;
     
     // clock
     clock1 = TIM7->CNT; // 1MHz
@@ -256,7 +264,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
       Initialization = 0;
     }
     
-    if (timeSec == 3){
+    if (timeSec == 9){
       HAL_TIM_Base_Start_IT(&htim5);
     }
     
@@ -292,7 +300,7 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
+  HAL_Init(); 
 
   /* USER CODE BEGIN Init */
   
@@ -334,7 +342,10 @@ int main(void)
   
   //Timer
   HAL_TIM_Base_Start(&htim7);
-
+  
+  // [[ Start main loop ]] (200Hz)
+  gravity_compensation_initialize(controller_id);
+  HAL_TIM_Base_Start_IT(&htim4);
   HAL_UART_Receive_DMA(&huart2, rxDataDMA, RX_BUF_LEN);
 
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)&adcValue, 1);
